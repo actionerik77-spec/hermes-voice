@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ai.hermes.watchdog-dashboard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/YOUR_USER/.hermes/bin/watchdog_dashboard.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BACKEND_LABEL</key><string>ai.hermes.gateway</string>
+    <key>BACKEND_URL</key><string>http://127.0.0.1:9128/</string>
+    <key>PROXY_LABEL</key><string>ai.hermes.dashboard-tailscale-proxy</string>
+    <key>PROXY_URL</key><string>http://100.x.y.z:9119/</string>
+  </dict>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>/Users/YOUR_USER/.hermes/logs/watchdog-dashboard.err.log</string>
+</dict>
+</plist>

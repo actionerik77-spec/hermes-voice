@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Hermes Voice STT shim -> FluidAudio Parakeet (local CoreML).
+# Usage: parakeet-stt <input_wav> <output_txt>
+# Uses an on-disk model dir when present; otherwise FluidAudioCLI downloads it.
+set -euo pipefail
+in="$1"; out="$2"
+tmp="$(mktemp -t parakeet-stt).json"
+trap 'rm -f "$tmp"' EXIT
+cli="${FLUIDAUDIO_CLI:-$HOME/hermes-voice-deps/FluidAudio/.build/release/FluidAudioCLI}"
+model_dir="${AIRMIC_PARAKEET_MODEL_DIR:-$HOME/Library/Application Support/FluidAudio/Models/parakeet-tdt-0.6b-v2-coreml}"
+args=(transcribe "$in" --model-version v2 --output-json "$tmp")
+[ -d "$model_dir" ] && args+=(--model-dir "$model_dir")
+"$cli" "${args[@]}" >/dev/null 2>&1
+/usr/bin/python3 -c 'import json,sys; t=(json.load(open(sys.argv[1])).get("text") or "").strip(); assert t, "empty transcript"; print(t)' "$tmp" > "$out"

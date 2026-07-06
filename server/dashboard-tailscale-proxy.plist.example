@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ai.hermes.dashboard-tailscale-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/YOUR_USER/.hermes/scripts/tailscale_tcp_forward.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Your agent machine's Tailscale IP -->
+    <key>LISTEN_HOST</key><string>100.x.y.z</string>
+    <key>LISTEN_PORT</key><string>9119</string>
+    <!-- Where your Hermes dashboard actually listens (loopback) -->
+    <key>TARGET_HOST</key><string>127.0.0.1</string>
+    <key>TARGET_PORT</key><string>9128</string>
+    <!-- Comma-separated Tailscale IPs allowed to connect (your client machines) -->
+    <key>ALLOW_CLIENTS</key><string>100.a.b.c,127.0.0.1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/YOUR_USER/.hermes/logs/dashboard-tailscale-proxy.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOUR_USER/.hermes/logs/dashboard-tailscale-proxy.err.log</string>
+</dict>
+</plist>

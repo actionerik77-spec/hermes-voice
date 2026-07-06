@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+PY="${AIRMIC_PYTHON:-$HOME/.hermes/hermes-agent/venv/bin/python}"
+SCRIPT="${AIRMIC_SCRIPT:-$HOME/.local/share/airmic/airmic.py}"
+if [[ -z "${AIRMIC_EXPECT_PARENT_PID:-}" ]]; then
+  if [[ "${PPID:-1}" == "1" ]]; then
+    export AIRMIC_EXPECT_PARENT_PID="-1"
+  else
+    export AIRMIC_EXPECT_PARENT_PID="$PPID"
+  fi
+fi
+if [[ ! -x "$PY" ]]; then
+  echo "airmic: Hermes venv python not executable: $PY" >&2
+  exit 127
+fi
+exec "$PY" "$SCRIPT" "$@"
