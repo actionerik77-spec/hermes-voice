@@ -551,14 +551,20 @@ def transcribe_parakeet(path: str) -> dict:
     if model_dir is not None:
         cmd += ["--model-dir", str(model_dir)]
     started = time.time()
-    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
-    elapsed = time.time() - started
-    data = {}
-    if out_json.exists():
+    try:
+        proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        elapsed = time.time() - started
+        data = {}
+        if out_json.exists():
+            try:
+                data = json.loads(out_json.read_text(errors="ignore") or "{}")
+            except Exception:
+                data = {}
+    finally:
         try:
-            data = json.loads(out_json.read_text(errors="ignore") or "{}")
+            out_json.unlink(missing_ok=True)
         except Exception:
-            data = {}
+            pass
     transcript = str(data.get("text") or proc.stdout or "").strip()
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or f"FluidAudioCLI exited {proc.returncode}").strip()[:1000])
@@ -1272,6 +1278,295 @@ def _emit_ndjson(obj: dict) -> None:
 CHAT_SESSION_STATE = Path.home() / ".hermes" / "voicepill" / "chat_session.json"
 
 
+VOICE_GOAL_STATE = Path.home() / ".hermes" / "voicepill" / "goal_state.json"
+
+
+def _load_voice_goal_config() -> dict:
+    """Load speech-to-/goal enforcement knobs from config.yaml.
+
+    User-facing behavioral config lives under either:
+
+      voice.goal_enforcement: {...}
+      voicepill.goal_enforcement: {...}
+
+    Unknown keys are ignored by Hermes core, so this helper can evolve without
+    making this client a second Hermes runtime.
+    """
+    defaults = {
+        "enabled": True,
+        "aliases": {},
+        "status_phrases": [
+            "slash goal",
+            "goal status",
+            "slash goal status",
+            "what is the goal",
+        ],
+        "generic_triggers": [
+            "slash goal",
+            "set goal",
+            "set a goal",
+            "start goal",
+            "start a goal",
+            "voice goal",
+            "voicing goal",
+            "set voice goal",
+            "set a voice goal",
+            "set voicing goal",
+            "set a voicing goal",
+            "use slash goal",
+            "use goal mode",
+            "goal mode",
+            "execute",
+        ],
+        "violent_triggers": [
+            "execute violently",
+            "execute violent",
+            "run violently",
+            "violent goal",
+            "max force",
+            "go max force",
+            "full send",
+        ],
+        "rdc_triggers": [
+            "rdc",
+            "r d c",
+            "reengineer done condition",
+            "re engineer done condition",
+            "re-engineer done condition",
+            "reengineer the done condition",
+            "re engineer the done condition",
+            # Common transcription miss for the spoken "RDC" trigger.
+            "reengineer lung condition",
+            "re engineer lung condition",
+        ],
+    }
+    cfg = {}
+    cfg_path = Path.home() / ".hermes" / "config.yaml"
+    try:
+        import yaml  # type: ignore
+        raw = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
+        if isinstance(raw, dict):
+            voice = raw.get("voice") if isinstance(raw.get("voice"), dict) else {}
+            voicepill = raw.get("voicepill") if isinstance(raw.get("voicepill"), dict) else {}
+            for section in (voice.get("goal_enforcement"), voicepill.get("goal_enforcement")):
+                if isinstance(section, dict):
+                    cfg.update(section)
+    except Exception:
+        cfg = {}
+    merged = dict(defaults)
+    for k, v in cfg.items():
+        if k in {"generic_triggers", "violent_triggers", "rdc_triggers", "status_phrases"} and isinstance(v, list):
+            merged[k] = [str(x) for x in v if str(x).strip()]
+        elif k == "aliases" and isinstance(v, dict):
+            merged[k] = {str(a): str(b) for a, b in v.items() if str(a).strip() and str(b).strip()}
+        elif k == "enabled":
+            merged[k] = str(v).strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            merged[k] = v
+    return merged
+
+
+def _voice_goal_status() -> dict:
+    cfg = _load_voice_goal_config()
+    state = _load_voice_goal_state()
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "config": "~/.hermes/config.yaml: voice.goal_enforcement",
+        "aliases": sorted((cfg.get("aliases") or {}).keys()),
+        "last_goal_set": bool(state.get("last_goal")),
+    }
+
+
+def _load_voice_goal_state() -> dict:
+    try:
+        raw = json.loads(VOICE_GOAL_STATE.read_text())
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_voice_goal_state(goal: str, mode: str = "") -> None:
+    if not goal.strip():
+        return
+    try:
+        VOICE_GOAL_STATE.parent.mkdir(parents=True, exist_ok=True)
+        VOICE_GOAL_STATE.write_text(json.dumps({
+            "last_goal": goal.strip(),
+            "mode": mode,
+            "updated_at": time.time(),
+        }, indent=2))
+    except Exception:
+        pass
+
+
+def _norm_voice(text: str) -> str:
+    text = text.lower().replace("/", " slash ")
+    text = re.sub(r"[^a-z0-9_./~:-]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _raw_rest_after_voice_prefix(text: str, phrase: str) -> str | None:
+    """Return the original text after a spoken trigger prefix.
+
+    Prefix matching uses normalized speech text, but the mission body may be an
+    exact file path. Do not return the normalized body; it turns `/Users/...`
+    into `slash users ...` and breaks RDC file handoffs.
+    """
+    tokens = re.findall(r"[a-z0-9_]+", _norm_voice(phrase))
+    if not tokens:
+        return None
+    sep = r"[\s\-_/.,:;]*"
+    pattern = r"^\s*" + sep.join(re.escape(t) for t in tokens) + r"\b"
+    match = re.match(pattern, text, flags=re.I)
+    if not match:
+        return None
+    return text[match.end():].strip()
+
+
+def _match_voice_prefix(text: str, phrases: list[str]) -> tuple[str, str] | None:
+    norm = _norm_voice(text)
+    for phrase in sorted(phrases, key=lambda s: len(_norm_voice(s)), reverse=True):
+        pnorm = _norm_voice(phrase)
+        if not pnorm:
+            continue
+        if norm == pnorm:
+            return phrase, ""
+        if norm.startswith(pnorm + " "):
+            raw_rest = _raw_rest_after_voice_prefix(text, phrase)
+            return phrase, raw_rest if raw_rest is not None else norm[len(pnorm):].strip()
+    return None
+
+
+def _trim_goal_filler(rest: str) -> str:
+    rest = (rest or "").strip(" .,:;-—")
+    rest = re.sub(r"^(to|for|on|about|as|that|this|the|a|an)\s+", "", rest, flags=re.I)
+    rest = re.sub(r"^(please\s+)?", "", rest, flags=re.I).strip()
+    return rest
+
+
+def _wrap_voice_goal(mode: str, mission: str) -> str:
+    if mode == "violent":
+        return (
+            "Complete this until done with Execute Violently / RDC gates: "
+            f"{mission}. Inspect first, harden the done condition, use tools, "
+            "verify with real output, and finish with a proof ledger."
+        )
+    if mode == "rdc":
+        return (
+            "Reengineer the done condition and complete the task until done: "
+            f"{mission}. Lock source of truth, write/patch the canonical plan if needed, "
+            "execute only safe in-scope work, verify every gate, and report blockers honestly."
+        )
+    return f"Complete this until done: {mission}"
+
+
+def _maybe_alias_goal(mode: str, mission: str, cfg: dict) -> str:
+    aliases = cfg.get("aliases") or {}
+    norm = _norm_voice(mission)
+    for phrase, target in aliases.items():
+        pnorm = _norm_voice(str(phrase))
+        if not pnorm:
+            continue
+        if norm == pnorm or norm.startswith(pnorm + " "):
+            extra = norm[len(pnorm):].strip() if norm.startswith(pnorm) else ""
+            goal = str(target).strip()
+            if goal.startswith("~"):
+                goal = str(Path(goal).expanduser())
+            if goal.startswith("/"):
+                goal = _wrap_voice_goal(mode, goal)
+            if extra:
+                goal = f"{goal}\n\nAdditional spoken context: {extra}"
+            return goal
+    return ""
+
+
+def _goal_arg_for_voice(mode: str, mission: str, cfg: dict) -> str:
+    mission = _trim_goal_filler(mission)
+    if not mission:
+        state = _load_voice_goal_state()
+        mission = str(state.get("last_goal") or "").strip()
+        if mission:
+            return mission
+        return ""
+
+    alias_goal = _maybe_alias_goal(mode, mission, cfg)
+    if alias_goal:
+        return alias_goal
+
+    lower = mission.lower().strip()
+    if lower in {"status", "pause", "resume", "clear", "stop", "done", "show"}:
+        return lower
+    if lower.startswith("complete this until done"):
+        return mission
+
+    return _wrap_voice_goal(mode, mission)
+
+
+def _voice_goal_intent(text: str) -> dict | None:
+    """Return a native `/goal` dispatch intent for speech-friendly triggers.
+
+    The helper deliberately recognizes only prefix triggers. Casual mentions of
+    goals in the middle of a normal prompt pass through untouched.
+    """
+    original = (text or "").strip()
+    if not original:
+        return None
+    cfg = _load_voice_goal_config()
+    if not bool(cfg.get("enabled", True)):
+        return None
+
+    # Typed/manual direct slash support, used by diagnostics and future helpers.
+    if original.startswith("/goal"):
+        arg = original[len("/goal"):].strip()
+        return {"mode": "literal", "arg": arg, "spoken": original}
+
+    control_map = {
+        "pause goal": "pause",
+        "resume goal": "resume",
+        "clear goal": "clear",
+        "stop goal": "clear",
+        "goal status": "status",
+        "what is the goal": "status",
+    }
+    norm = _norm_voice(original)
+    if norm in control_map:
+        return {"mode": "control", "arg": control_map[norm], "spoken": original}
+
+    buckets = [
+        ("violent", list(cfg.get("violent_triggers") or [])),
+        ("rdc", list(cfg.get("rdc_triggers") or [])),
+        ("generic", list(cfg.get("generic_triggers") or [])),
+    ]
+    for mode, phrases in buckets:
+        hit = _match_voice_prefix(original, phrases)
+        if not hit:
+            continue
+        phrase, rest = hit
+        # "slash goal" with no argument means native goal status, matching Hermes.
+        if mode == "generic" and _norm_voice(phrase) in {"slash goal", "use slash goal"} and not rest:
+            arg = "status"
+        else:
+            arg = _goal_arg_for_voice(mode, rest, cfg)
+        if not arg:
+            return {"mode": mode, "arg": "", "spoken": original, "error": "goal trigger heard but no goal text or saved voice goal exists"}
+        return {"mode": mode, "arg": arg, "spoken": original, "trigger": phrase}
+    return None
+
+
+def cmd_goal_preview(args: argparse.Namespace) -> int:
+    text = args.text or (sys.stdin.read().strip() if not sys.stdin.isatty() else "")
+    intent = _voice_goal_intent(text)
+    out = {"ok": bool(intent), "input": text, "goal_enforcement": _voice_goal_status(), "intent": intent}
+    jprint(out, json_mode=args.json)
+    if intent and not intent.get("error"):
+        return 0
+    return 2
+
+
+
+
+
 def _load_chat_session() -> dict:
     try:
         return dict(json.loads(CHAT_SESSION_STATE.read_text()))
@@ -1291,7 +1586,7 @@ def _save_chat_session(live_id: str, session_key: str) -> None:
         pass
 
 
-async def _chat_turn(dashboard: str, session_id: str, text: str, wait_seconds: float, allow_busy: bool, speaker=None) -> dict:
+async def _chat_turn(dashboard: str, session_id: str, text: str, wait_seconds: float, allow_busy: bool, speaker=None, goal_arg: str | None = None, goal_source: str = "") -> dict:
     """Submit one prompt into the live N1 session over a single websocket and
     stream reply events (NDJSON on stdout) until message.complete."""
     import websockets
@@ -1390,8 +1685,41 @@ async def _chat_turn(dashboard: str, session_id: str, text: str, wait_seconds: f
         if str(target.get("status") or "").lower() in {"working", "running", "busy"} and not allow_busy:
             raise RuntimeError("target session busy; pass --allow-busy to queue anyway")
 
+        def _save_own_session() -> None:
+            # Explicit --session-id turns (tests/diagnostics) must NEVER
+            # overwrite the pill's own call lineage — that bleed sent live
+            # voice turns into a test session (2026-07-03).
+            if not session_id:
+                _save_chat_session(str(target.get("id") or ""), str(target.get("session_key") or ""))
+
+        if goal_arg is not None:
+            goal_arg = str(goal_arg or "").strip()
+            if not goal_arg:
+                raise RuntimeError("voice goal trigger heard, but no goal text resolved")
+            dispatch = await rpc("command.dispatch", {"session_id": sid, "name": "goal", "arg": goal_arg}, timeout=20)
+            dtype = str(dispatch.get("type") or "")
+            notice = str(dispatch.get("notice") or "")
+            message = str(dispatch.get("message") or "")
+            output = str(dispatch.get("output") or "")
+            _emit_ndjson({
+                "event": "goal_enforced",
+                "source": goal_source or "voice",
+                "dispatch_type": dtype,
+                "chars": len(goal_arg),
+                "notice": notice[:240],
+            })
+            if dtype == "send":
+                _save_voice_goal_state(goal_arg, mode=goal_source or "voice")
+                text = message or goal_arg
+            else:
+                final = output or notice or f"Goal command handled: {goal_arg}"
+                _emit_ndjson({"event": "complete", "text": final})
+                result.update({"ok": True, "final_text": final})
+                _save_own_session()
+                return result
+
         await rpc("prompt.submit", {"session_id": sid, "text": text}, timeout=20)
-        _emit_ndjson({"event": "submitted", "chars": len(text)})
+        _emit_ndjson({"event": "submitted", "chars": len(text), "goal_enforced": goal_arg is not None})
 
         deadline = time.monotonic() + wait_seconds
         last_heartbeat = time.monotonic()
@@ -1441,13 +1769,6 @@ async def _chat_turn(dashboard: str, session_id: str, text: str, wait_seconds: f
                 if empty_polls < 6:
                     return None
             return final
-
-        def _save_own_session() -> None:
-            # Explicit --session-id turns (tests/diagnostics) must NEVER
-            # overwrite the pill's own call lineage — that bleed sent live
-            # voice turns into a test session (2026-07-03).
-            if not session_id:
-                _save_chat_session(str(target.get("id") or ""), str(target.get("session_key") or ""))
 
         def _recovered_result(final: str) -> dict:
             _emit_ndjson({"event": "complete", "text": final, "recovered": "ws-reconnect"})
@@ -1745,11 +2066,32 @@ def cmd_chat(args: argparse.Namespace) -> int:
     if _is_hangup_utterance(text):
         return cmd_hangup(args)
 
+    goal_intent = _voice_goal_intent(text)
+    if goal_intent and goal_intent.get("error"):
+        _emit_ndjson({"event": "error", "message": str(goal_intent.get("error"))})
+        return 2
+
     speaker = StreamingSpeaker(emit=_emit_ndjson) if args.speak else None
     try:
-        res = asyncio.run(_chat_turn(args.dashboard, args.session_id, text, args.wait, args.allow_busy, speaker=speaker))
+        res = asyncio.run(_chat_turn(
+            args.dashboard,
+            args.session_id,
+            text,
+            args.wait,
+            args.allow_busy,
+            speaker=speaker,
+            goal_arg=(goal_intent or {}).get("arg") if goal_intent else None,
+            goal_source=(goal_intent or {}).get("mode", "") if goal_intent else "",
+        ))
     except Exception as e:
         _emit_ndjson({"event": "error", "message": f"{type(e).__name__}: {e}"})
+        if speaker is not None:
+            # Drain what's already synthesized/queued instead of cutting the
+            # voice off mid-sentence when the turn dies.
+            try:
+                speaker.finish("")
+            except Exception:
+                pass
         return 1
 
     final = str(res.get("final_text") or "")
@@ -1812,6 +2154,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "audio": audio_devices(),
         "stt": stt_status,
         "tts": _airmic_tts_route(),
+        "goal_enforcement": _voice_goal_status(),
         "token_parse": "not_printed",
     }
     try:
@@ -1966,6 +2309,10 @@ def main() -> int:
     sp = sub.add_parser("transcribe")
     sp.add_argument("path")
     sp.set_defaults(func=cmd_transcribe)
+
+    sp = sub.add_parser("goal-preview")
+    sp.add_argument("text", nargs="?")
+    sp.set_defaults(func=cmd_goal_preview)
 
     sp = sub.add_parser("inject")
     sp.add_argument("text", nargs="?")
